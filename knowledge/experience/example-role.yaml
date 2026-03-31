@@ -1,0 +1,32 @@
+# Experience Entry Template — CUSTOMIZE THIS
+# Create one file per work experience: company-role.yaml
+# The build agent selects the most relevant entries per job posting
+
+company: "Company Name"
+title: "Software Engineer"
+type: "full-time"  # full-time, contract, internship
+location: "City, State or Remote"
+start_date: "Jan 2024"
+end_date: "Present"
+company_description: "Brief description of the company."
+
+bullets:
+  - "Default resume-ready bullet point with action verb and metrics"
+  - "Another achievement-oriented bullet point"
+
+tech_used:
+  - "TypeScript"
+  - "React"
+  - "PostgreSQL"
+
+# Bullet variants let the build agent pick the best framing per job
+bullet_variants:
+  technical:
+    - "Same achievement reframed to emphasize technical depth"
+    - "Another technically-focused bullet"
+  impact:
+    - "Same achievement reframed to emphasize measurable results"
+    - "Another impact-focused bullet"
+  leadership:
+    - "Same achievement reframed to emphasize leadership and ownership"
+    - "Another leadership-focused bullet"

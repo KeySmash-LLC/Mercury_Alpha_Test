@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""
+PostHog event tracker — called by the Claude orchestrator during interactive sessions.
+
+Usage:
+    python scripts/ph-track <event_name> [key=value ...]
+
+Examples:
+    python scripts/ph-track scout_complete jobs_found=3
+    python scripts/ph-track pipeline_complete phase=scout scouted=5 built=0
+    python scripts/ph-track session_replay_start phase=submit
+"""
+
+import sys
+import os
+import json
+
+# Allow importing analytics.py from the same scripts/ directory
+sys.path.insert(0, os.path.dirname(__file__))
+from analytics import get_or_create_distinct_id, inject_pipeline_session_id
+
+# ---------------------------------------------------------------------------
+# Load .env manually (no python-dotenv dependency)
+# ---------------------------------------------------------------------------
+_env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _val = _line.split("=", 1)
+                os.environ[_key.strip()] = _val.strip()
+
+# ---------------------------------------------------------------------------
+# Resolve distinct_id — generate and persist if absent, fail if still missing
+# ---------------------------------------------------------------------------
+DISTINCT_ID = get_or_create_distinct_id()
+if not DISTINCT_ID:
+    print("Error: POSTHOG_DISTINCT_ID is not set and could not be generated.", file=sys.stderr)
+    print("Run ./scripts/setup-chrome-profile.sh or set POSTHOG_DISTINCT_ID in .env", file=sys.stderr)
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Parse args
+# ---------------------------------------------------------------------------
+args = sys.argv[1:]
+if not args:
+    print("Usage: ph-track <event_name> [key=value ...]", file=sys.stderr)
+    print("Example: ph-track scout_complete jobs_found=3 phase=scout", file=sys.stderr)
+    sys.exit(1)
+
+event_name = args[0]
+properties = {}
+for arg in args[1:]:
+    if "=" in arg:
+        k, v = arg.split("=", 1)
+        # Try to coerce numeric strings to int/float
+        try:
+            properties[k] = int(v)
+        except ValueError:
+            try:
+                properties[k] = float(v)
+            except ValueError:
+                properties[k] = v
+    else:
+        print(f"Warning: skipping malformed property '{arg}' (expected key=value)", file=sys.stderr)
+
+# If invoked from inside a pipeline subprocess, inherit the session_id automatically
+# so orchestrator events are linkable to the run that spawned them.
+inject_pipeline_session_id(properties)
+
+# ---------------------------------------------------------------------------
+# Send event
+# ---------------------------------------------------------------------------
+api_key = os.environ.get("POSTHOG_API_KEY")
+if not api_key:
+    print("ph-track: POSTHOG_API_KEY not set — event not sent.", file=sys.stderr)
+    sys.exit(0)  # Exit cleanly — don't break the orchestrator
+
+try:
+    from posthog import Posthog
+    ph = Posthog(api_key, host="https://us.i.posthog.com")
+    # Set person properties (name) if POSTHOG_USER_NAME is configured
+    user_name = os.environ.get("POSTHOG_USER_NAME", "").strip()
+    if user_name:
+        properties["$set"] = {"name": user_name}
+    ph.capture(distinct_id=DISTINCT_ID, event=event_name, properties=properties)
+    ph.flush()
+    print(f"ph-track: sent '{event_name}' {json.dumps(properties)}")
+except ImportError:
+    print("ph-track: posthog package not installed — event not sent.", file=sys.stderr)
+except Exception as e:
+    print(f"ph-track: failed to send event: {e}", file=sys.stderr)

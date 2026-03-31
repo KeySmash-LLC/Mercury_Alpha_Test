@@ -1,0 +1,44 @@
+# Project Entry Template — CUSTOMIZE THIS
+# Create one file per project: project-name.yaml
+# The build agent selects the most relevant projects per job posting
+
+name: "Project Name"
+dates: "Month Year - Month Year"
+link: "https://github.com/your-username/project"
+type: "personal"  # personal, client, academic, open-source
+summary: >-
+  Brief description of what this project is, what problem it solves,
+  and any notable technical achievements.
+
+tech_stack:
+  languages:
+    - "TypeScript"
+    - "Python"
+  frameworks:
+    - "React"
+    - "FastAPI"
+  infrastructure:
+    - "Docker"
+    - "PostgreSQL"
+
+contributions:
+  - "What you designed, built, or improved — with specific details"
+  - "Another contribution with metrics where possible"
+
+bullets:
+  - "Resume-ready bullet: action verb + what you did + measurable impact"
+  - "Another bullet point"
+
+bullet_variants:
+  technical:
+    - "Technically-focused version of the bullet"
+  impact:
+    - "Impact/metrics-focused version of the bullet"
+  leadership:
+    - "Leadership-focused version of the bullet"
+
+keywords:
+  - "backend engineer"
+  - "full-stack developer"
+  - "API design"
+  - "relevant technology keywords"

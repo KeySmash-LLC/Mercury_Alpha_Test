@@ -1,0 +1,1346 @@
+#!/usr/bin/env python3
+"""
+Job Application Pipeline — Phone-friendly CLI
+
+Usage from SSH:
+    pipeline 10            Scout + build + submit 10 jobs
+    pipeline scout 15      Scout 15 jobs only
+    pipeline build         Build all scouted jobs
+    pipeline submit        Submit all built applications
+    pipeline retry         Retry all blocked applications
+    pipeline status        Show job counts & running state
+    pipeline watch         Live dashboard (refreshes every 5s)
+    pipeline follow        Stream log output in real-time
+    pipeline log           Last 50 lines of log
+    pipeline attach        Attach to running tmux session
+    pipeline stop          Kill pipeline + claude processes
+    pipeline nuke          Kill EVERYTHING (tmux, claude, chrome)
+
+Upwork:
+    pipeline upwork 10         Scout + propose 10 contracts
+    pipeline upwork scout 5    Scout Upwork for 5 contracts
+    pipeline upwork propose    Write proposals for scouted contracts
+    pipeline upwork status     Show contract counts
+"""
+
+import sys
+import os
+import subprocess
+import time
+import shutil
+import uuid
+from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass, field
+import yaml
+import requests
+from posthog import Posthog
+from urllib.parse import urlparse
+
+# Allow importing analytics.py from the same scripts/ directory
+sys.path.insert(0, os.path.dirname(__file__))
+from analytics import get_or_create_distinct_id, compute_cost_per_app
+
+# ---------------------------------------------------------------------------
+# Load .env manually
+# ---------------------------------------------------------------------------
+env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+if os.path.exists(env_path):
+    with open(env_path) as f:
+        for line in f:
+            if line.strip() and not line.startswith("#"):
+                key, val = line.strip().split("=", 1)
+                os.environ[key] = val
+
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+DISTINCT_ID = get_or_create_distinct_id()
+if not DISTINCT_ID:
+    print("Error: POSTHOG_DISTINCT_ID is not set and could not be generated.", file=sys.stderr)
+    print("Run ./scripts/setup-chrome-profile.sh or set POSTHOG_DISTINCT_ID in .env", file=sys.stderr)
+    sys.exit(1)
+
+# Unique ID for this pipeline run — used to scope per-run queries in PostHog
+SESSION_ID = str(uuid.uuid4())
+
+# Accumulated Claude API cost and token counts for the current run; reset at
+# the start of each run_pipeline() / run_upwork_pipeline() call
+_run_cost_usd: float = 0.0
+_run_tokens: dict = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+
+ph_client = Posthog(
+    os.environ.get("POSTHOG_API_KEY", "phc_placeholder_key"),
+    host="https://us.i.posthog.com",
+    disabled=not os.environ.get("POSTHOG_API_KEY")
+)
+
+# Set person properties (name) if POSTHOG_USER_NAME is configured.
+# The Python SDK uses capture() with $set to set person properties.
+_ph_user_name = os.environ.get("POSTHOG_USER_NAME", "").strip()
+if _ph_user_name:
+    ph_client.capture(distinct_id=DISTINCT_ID, event="$identify", properties={"$set": {"name": _ph_user_name}})
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+@dataclass
+class Config:
+    explorer: Path = SCRIPT_DIR.parent  # Explorer/ (one level up from scripts/)
+    log_dir: Path = SCRIPT_DIR / "logs"
+    ntfy_topic: str = f"explorer-{os.environ.get('USER', 'default')}"
+    tmux_session: str = "pipeline"
+
+    # High turn limit so claude -p doesn't exit early (default is ~10)
+    max_turns: int = 200
+
+    upwork_tmux_session: str = "upwork-pipeline"
+
+    @property
+    def jobs_dir(self) -> Path:
+        return self.explorer / "data/jobs"
+
+    @property
+    def contracts_dir(self) -> Path:
+        return self.explorer / "data/contracts"
+
+
+CFG = Config()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+class Logger:
+    """Writes to a log file and prints to stdout simultaneously."""
+
+    def __init__(self, log_dir: Path):
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = log_dir / f"pipeline_{timestamp}.log"
+        self._file = open(self.path, "a")
+
+    def log(self, message: str):
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+        print(line, flush=True)
+        self._file.write(line + "\n")
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+
+def notify(message: str, logger: Logger | None = None):
+    """Send a push notification via ntfy.sh and log the message."""
+    if logger:
+        logger.log(message)
+    try:
+        requests.post(
+            f"https://ntfy.sh/{CFG.ntfy_topic}",
+            data=message.encode(),
+            timeout=5,
+        )
+    except Exception:
+        pass  # notifications are best-effort
+
+
+def get_latest_log() -> Path | None:
+    """Find the most recent log file."""
+    logs = sorted(CFG.log_dir.glob("pipeline_*.log"), reverse=True)
+    return logs[0] if logs else None
+
+
+def read_job_status(job_yaml: Path) -> str | None:
+    """Read the latest status from a job.yaml file."""
+    try:
+        data = yaml.safe_load(job_yaml.read_text())
+        history = data.get("status_history", [])
+        if history:
+            return history[-1].get("status")
+    except Exception:
+        pass
+    return None
+
+
+def count_jobs() -> dict[str, int]:
+    """Count jobs by their current status."""
+    counts = {"scouted": 0, "built": 0, "submitted": 0, "blocked": 0}
+    if not CFG.jobs_dir.exists():
+        return counts
+    for job_yaml in CFG.jobs_dir.glob("*/job.yaml"):
+        status = read_job_status(job_yaml)
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def jobs_with_status(status: str) -> list[Path]:
+    """Get job directories that have a given status."""
+    results = []
+    if not CFG.jobs_dir.exists():
+        return results
+    for job_yaml in CFG.jobs_dir.glob("*/job.yaml"):
+        if read_job_status(job_yaml) == status:
+            results.append(job_yaml.parent)
+    return sorted(results)
+
+
+def is_pipeline_running(session: str | None = None) -> bool:
+    """Check if a tmux pipeline session exists."""
+    if not shutil.which("tmux"):
+        return False
+    result = subprocess.run(
+        ["tmux", "has-session", "-t", session or CFG.tmux_session],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Upwork contract helpers
+# ---------------------------------------------------------------------------
+
+def read_contract_status(contract_yaml: Path) -> str | None:
+    """Read the latest status from a contract.yaml file."""
+    try:
+        data = yaml.safe_load(contract_yaml.read_text())
+        history = data.get("status_history", [])
+        if history:
+            return history[-1].get("status")
+    except Exception:
+        pass
+    return None
+
+
+def count_contracts() -> dict[str, int]:
+    """Count contracts by their current status."""
+    counts = {"scouted": 0, "proposed": 0, "approved": 0, "submitted": 0, "blocked": 0}
+    if not CFG.contracts_dir.exists():
+        return counts
+    for cy in CFG.contracts_dir.glob("*/contract.yaml"):
+        status = read_contract_status(cy)
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def contracts_with_status(status: str) -> list[Path]:
+    """Get contract directories that have a given status."""
+    results = []
+    if not CFG.contracts_dir.exists():
+        return results
+    for cy in CFG.contracts_dir.glob("*/contract.yaml"):
+        if read_contract_status(cy) == status:
+            results.append(cy.parent)
+    return sorted(results)
+
+
+def _log_tool_use(tool: str, tool_input: dict, logger: Logger, tool_counts: dict[str, int]):
+    """Log a tool_use content block with context-appropriate detail."""
+    tool_counts[tool] = tool_counts.get(tool, 0) + 1
+
+    if tool == "Task":
+        agent_type = tool_input.get("subagent_type", "?")
+        desc = tool_input.get("description", "")
+        bg = " (background)" if tool_input.get("run_in_background") else ""
+        logger.log(f"[agent] Spawning {agent_type}: {desc}{bg}")
+    elif tool.startswith("mcp__"):
+        short_name = tool.split("__")[-1]
+        parts = [f"[mcp] {short_name}"]
+        for key in ("instanceId", "url", "ref", "value", "text", "domState"):
+            if key in tool_input:
+                val = str(tool_input[key])
+                if len(val) > 60:
+                    val = val[:60] + "..."
+                parts.append(f"{key}={val}")
+        logger.log(" ".join(parts))
+    else:
+        detail = ""
+        if tool == "Read" and "file_path" in tool_input:
+            detail = f" {tool_input['file_path']}"
+        elif tool == "Bash" and "command" in tool_input:
+            cmd_text = tool_input["command"]
+            if len(cmd_text) > 80:
+                cmd_text = cmd_text[:80] + "..."
+            detail = f" $ {cmd_text}"
+        elif tool == "Write" and "file_path" in tool_input:
+            detail = f" {tool_input['file_path']}"
+        logger.log(f"[tool] {tool}{detail}")
+
+
+def _log_tool_result(content, logger: Logger):
+    """Log a tool_result with a short summary."""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        # content is array of {type, content/text} blocks
+        texts = []
+        for block in content:
+            if isinstance(block, dict):
+                texts.append(block.get("content", block.get("text", "")))
+        text = " ".join(t for t in texts if t)
+    else:
+        text = str(content)
+
+    text = " ".join(text.split())
+    if len(text) > 200:
+        text = text[:200] + "..."
+    if text:
+        logger.log(f"[result] {text}")
+
+
+def run_claude(prompt: str, logger: Logger):
+    """Run claude -p headlessly, streaming output to logger."""
+    import json as _json
+
+    mcp_config = CFG.explorer / ".claude" / "mcp.json"
+
+    cmd = [
+        "claude", "-p",
+        "--max-turns", str(CFG.max_turns),
+        "--output-format", "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+        "--mcp-config", str(mcp_config),
+        "--", prompt,
+    ]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,  # line-buffered
+        cwd=str(CFG.explorer),
+        env={**os.environ, "PIPELINE_SESSION_ID": SESSION_ID},
+    )
+
+    tool_counts: dict[str, int] = {}
+
+    # stream-json emits one JSON object per line
+    # Format: assistant messages contain tool_use content blocks,
+    #         user messages contain tool_result content blocks
+    for raw_line in process.stdout:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            event = _json.loads(raw_line)
+            msg_type = event.get("type", "")
+
+            if msg_type == "assistant" and "message" in event:
+                for block in event["message"].get("content", []):
+                    block_type = block.get("type", "")
+
+                    if block_type == "text":
+                        for text_line in block["text"].splitlines():
+                            logger.log(text_line)
+
+                    elif block_type == "tool_use":
+                        tool = block.get("name", "unknown")
+                        tool_input = block.get("input", {})
+                        _log_tool_use(tool, tool_input, logger, tool_counts)
+
+            elif msg_type == "user" and "message" in event:
+                for block in event["message"].get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        _log_tool_result(block.get("content", ""), logger)
+
+            elif msg_type == "result":
+                result_text = event.get("result", "")
+                if result_text:
+                    for text_line in result_text.splitlines():
+                        logger.log(text_line)
+
+                # Log cost and tokens if available, accumulate for the run total
+                cost = event.get("total_cost_usd")
+                if cost:
+                    global _run_cost_usd
+                    _run_cost_usd += float(cost)
+                    logger.log(f"[cost] ${cost:.4f}")
+
+                usage = event.get("usage")
+                if usage:
+                    global _run_tokens
+                    _run_tokens["input"] += int(usage.get("input_tokens", 0))
+                    _run_tokens["output"] += int(usage.get("output_tokens", 0))
+                    _run_tokens["cache_creation"] += int(usage.get("cache_creation_input_tokens", 0))
+                    _run_tokens["cache_read"] += int(usage.get("cache_read_input_tokens", 0))
+                    total_tok = _run_tokens["input"] + _run_tokens["output"]
+                    logger.log(f"[tokens] in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)} (run total: {total_tok})")
+
+        except _json.JSONDecodeError:
+            logger.log(raw_line)
+
+    process.wait()
+
+    if tool_counts:
+        summary_parts = [f"{name}={count}" for name, count in sorted(tool_counts.items())]
+        logger.log(f"[stats] Tool calls: {', '.join(summary_parts)}")
+
+    return process.returncode
+
+
+# ---------------------------------------------------------------------------
+# Pipeline phases
+# ---------------------------------------------------------------------------
+
+def phase_scout(num_jobs: int, logger: Logger) -> int:
+    """Scout for jobs. Retries up to 3 times if quota not met. Returns jobs found."""
+    before = count_jobs()["scouted"]
+    max_retries = 3
+    found_new = 0
+
+    for attempt in range(1, max_retries + 1):
+        remaining = num_jobs - found_new
+        if remaining <= 0:
+            break
+
+        if attempt > 1:
+            notify(f"SCOUT RETRY {attempt}/{max_retries}: still need {remaining} more jobs...", logger)
+        else:
+            notify(f"SCOUT: Finding {num_jobs} new jobs...", logger)
+
+        # Agents self-manage dedup via scout-state.yaml and Glob on data/jobs/
+        # No skip list needed in the prompt
+        prompt = f"""You are the pipeline orchestrator. Scout for exactly {remaining} new Software Engineer jobs.
+
+Spawn the Job-Scouter agent via the Task tool (subagent_type="Job-Scouter").
+Tell it to search LinkedIn and Indeed for Software Engineer positions in Washington state and remote.
+The agent will check data/jobs/scout-state.yaml to resume from where previous scouts left off, and will deduplicate against existing data/jobs/ directories automatically.
+
+After scouting completes, list the jobs found with company name and position title.
+Do NOT proceed to the build phase — only scout."""
+
+        exit_code = run_claude(prompt, logger)
+
+        if exit_code != 0:
+            notify(f"SCOUT: claude exited with code {exit_code} (budget/turn limit?)", logger)
+            ph_client.capture(distinct_id=DISTINCT_ID, event="agent_error",
+                              properties={"session_id": SESSION_ID, "phase": "scout", "exit_code": exit_code, "agent_model": "haiku"})
+
+        after = count_jobs()["scouted"]
+        found_new = after - before
+        notify(f"SCOUT: found {found_new}/{num_jobs} so far", logger)
+
+    if found_new == 0:
+        notify("SCOUT FAILED: found 0 new jobs after all retries.", logger)
+    elif found_new < num_jobs:
+        notify(f"SCOUT PARTIAL: wanted {num_jobs}, got {found_new}. Continuing with what we have.", logger)
+    else:
+        notify(f"SCOUT DONE: {found_new} new jobs found.", logger)
+
+    return found_new
+
+
+def phase_build(logger: Logger) -> tuple[int, int]:
+    """Build applications. One claude call, all jobs in parallel."""
+    jobs = jobs_with_status("scouted")
+
+    if not jobs:
+        notify("BUILD: No scouted jobs to build. Skipping.", logger)
+        return 0, 0
+
+    notify(f"BUILD: Building applications for {len(jobs)} scouted jobs...", logger)
+
+    job_list = "\n".join(f"- {job_dir}" for job_dir in jobs)
+
+    prompt = f"""You are the pipeline orchestrator. Build tailored applications for ALL of the following scouted jobs IN PARALLEL.
+
+Jobs to build:
+{job_list}
+
+For EACH job, spawn a Job-Application-Builder agent via the Task tool (subagent_type="Job-Application-Builder").
+Launch ALL of them in parallel in a single message — do NOT wait for one to finish before starting the next.
+
+Each agent should:
+1. Read the job posting from job.yaml
+2. Generate a tailored resume and cover letter using the knowledge base
+3. Compile PDFs using tectonic
+4. Update the job status to 'built'
+
+After ALL agents complete, report a summary: which jobs succeeded and which failed."""
+
+    exit_code = run_claude(prompt, logger)
+    if exit_code != 0:
+        ph_client.capture(distinct_id=DISTINCT_ID, event="agent_error",
+                          properties={"session_id": SESSION_ID, "phase": "build", "exit_code": exit_code})
+
+    # Check results
+    succeeded = 0
+    failed = 0
+    for job_dir in jobs:
+        has_resume = (job_dir / "resume.pdf").exists()
+        has_cover = (job_dir / "cover_letter.pdf").exists()
+        if has_resume and has_cover and read_job_status(job_dir / "job.yaml") == "built":
+            succeeded += 1
+            try:
+                job_data = yaml.safe_load((job_dir / "job.yaml").read_text())
+                ph_client.capture(
+                    distinct_id=DISTINCT_ID,
+                    event="build_succeeded",
+                    properties={
+                        "session_id": SESSION_ID,
+                        "job_id": job_dir.name,
+                        "company": job_data.get("company", "unknown"),
+                        "position": job_data.get("position", "unknown"),
+                        "source": job_data.get("source", "unknown"),
+                        "agent_model": "haiku",
+                    },
+                )
+            except Exception:
+                pass
+        else:
+            failed += 1
+            notify(f"BUILD FAILED: {job_dir.name}", logger)
+            try:
+                job_data = yaml.safe_load((job_dir / "job.yaml").read_text())
+                # KPI: build_failed — Build Reliability
+                ph_client.capture(
+                    distinct_id=DISTINCT_ID,
+                    event="build_failed",
+                    properties={
+                        "session_id": SESSION_ID,
+                        "job_id": job_dir.name,
+                        "company": job_data.get("company", "unknown"),
+                        "position": job_data.get("position", "unknown"),
+                        "source": job_data.get("source", "unknown"),
+                        "missing_resume": not has_resume,
+                        "missing_cover_letter": not has_cover,
+                    },
+                )
+            except Exception:
+                pass
+
+    notify(f"BUILD DONE: {succeeded} succeeded, {failed} failed", logger)
+    return succeeded, failed
+
+
+def phase_retry_blocked(logger: Logger) -> tuple[int, int, int]:
+    """Reset blocked jobs that have PDFs back to 'built' and re-submit them."""
+    blocked = jobs_with_status("blocked")
+
+    if not blocked:
+        notify("RETRY: No blocked jobs to retry.", logger)
+        return 0, 0, 0
+
+    # Only retry jobs that have their PDFs built — no point submitting without them
+    retryable = []
+    skipped = []
+    for job_dir in blocked:
+        has_resume = (job_dir / "resume.pdf").exists()
+        has_cover = (job_dir / "cover_letter.pdf").exists()
+        if has_resume and has_cover:
+            retryable.append(job_dir)
+        else:
+            skipped.append(job_dir)
+
+    if skipped:
+        notify(f"RETRY: Skipping {len(skipped)} blocked jobs with missing PDFs (run 'pipeline build' first).", logger)
+
+    if not retryable:
+        notify("RETRY: No retryable blocked jobs (all are missing PDFs).", logger)
+        return 0, 0, 0
+
+    notify(f"RETRY: Resetting {len(retryable)} blocked jobs to 'built' and re-submitting...", logger)
+
+    # Reset status to 'built' so phase_submit picks them up
+    today = datetime.now().strftime("%Y-%m-%d")
+    for job_dir in retryable:
+        job_yaml_path = job_dir / "job.yaml"
+        try:
+            data = yaml.safe_load(job_yaml_path.read_text())
+            data["status"] = "built"
+            data["retry_count"] = data.get("retry_count", 0) + 1
+            history = data.get("status_history", [])
+            history.append({
+                "date": today,
+                "status": "built",
+                "note": f"Reset from blocked for retry (attempt {data['retry_count']})",
+            })
+            data["status_history"] = history
+            job_yaml_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
+        except Exception as e:
+            notify(f"RETRY: Failed to reset {job_dir.name}: {e}", logger)
+
+    return phase_submit(logger)
+
+
+def phase_submit(logger: Logger) -> tuple[int, int, int]:
+    """Submit applications. One claude call per batch of 4 to avoid context overflow."""
+    jobs = jobs_with_status("built")
+
+    if not jobs:
+        notify("SUBMIT: No built jobs to submit. Skipping.", logger)
+        return 0, 0, 0
+
+    notify(f"SUBMIT: Submitting {len(jobs)} applications in batches of 4...", logger)
+
+    BATCH_SIZE = 4
+    total_submitted = 0
+    total_blocked = 0
+    total_failed = 0
+
+    # Fetch outbound IP once per submit phase for bot-detection context
+    try:
+        machine_ip = requests.get("https://api.ipify.org", timeout=3).text.strip()
+    except Exception:
+        machine_ip = "unknown"
+
+    for i in range(0, len(jobs), BATCH_SIZE):
+        batch = jobs[i:i + BATCH_SIZE]
+        batch_num = (i // BATCH_SIZE) + 1
+        total_batches = (len(jobs) + BATCH_SIZE - 1) // BATCH_SIZE
+
+        notify(f"SUBMIT BATCH {batch_num}/{total_batches}: {len(batch)} jobs...", logger)
+
+        # KPI: app_started — fired per job before each submission attempt
+        batch_start = time.time()
+        for job_dir in batch:
+            try:
+                job_data = yaml.safe_load((job_dir / "job.yaml").read_text())
+                apply_url = job_data.get("apply_url", job_data.get("url", ""))
+                retry_count = job_data.get("retry_count", 0)
+                ph_client.capture(
+                    distinct_id=DISTINCT_ID,
+                    event="app_started",
+                    properties={
+                        "session_id": SESSION_ID,
+                        "job_id": job_dir.name,
+                        "company": job_data.get("company", "unknown"),
+                        "position": job_data.get("position", "unknown"),
+                        "apply_url": apply_url,
+                        "job_board_domain": urlparse(apply_url).netloc or "unknown",
+                        "source": job_data.get("source", "unknown"),
+                        "batch_num": batch_num,
+                        "batch_size": len(batch),
+                        "agent_model": "haiku",
+                        "retry_count": retry_count,
+                        "is_retry": retry_count > 0,
+                    },
+                )
+            except Exception:
+                pass
+
+        job_list = "\n".join(f"- {job_dir}" for job_dir in batch)
+
+        prompt = f"""You are the pipeline orchestrator. Submit applications for the following {len(batch)} jobs.
+Launch ALL of them in parallel — each gets its own browser instance.
+
+Jobs to submit:
+{job_list}
+
+For EACH job, spawn a Job-Submiter agent via the Task tool (subagent_type="Job-Submiter").
+Each agent should:
+1. Read job.yaml to get the application URL
+2. Create a browser instance via instance_create
+3. Navigate to the application page
+4. Fill in all form fields using the candidate info
+5. Upload resume.pdf and cover_letter.pdf from the job folder
+6. Submit the application
+7. Update job status to 'submitted'
+8. If blocked by CAPTCHA or login wall, mark as 'blocked' and move on
+
+After ALL agents complete, report a short summary."""
+
+        cost_before_batch = _run_cost_usd
+        exit_code = run_claude(prompt, logger)
+        batch_duration = int(time.time() - batch_start)
+        batch_cost_usd = round(_run_cost_usd - cost_before_batch, 4)
+
+        if exit_code != 0:
+            ph_client.capture(distinct_id=DISTINCT_ID, event="agent_error",
+                              properties={"session_id": SESSION_ID, "phase": "submit", "exit_code": exit_code,
+                                          "batch_num": batch_num, "agent_model": "haiku"})
+
+        # Check results for this batch
+        for job_dir in batch:
+            status = read_job_status(job_dir / "job.yaml")
+            try:
+                job_data = yaml.safe_load((job_dir / "job.yaml").read_text())
+                apply_url = job_data.get("apply_url", job_data.get("url", ""))
+                retry_count = job_data.get("retry_count", 0)
+                job_props = {
+                    "session_id": SESSION_ID,
+                    "job_id": job_dir.name,
+                    "company": job_data.get("company", "unknown"),
+                    "position": job_data.get("position", "unknown"),
+                    "apply_url": apply_url,
+                    "job_board_domain": urlparse(apply_url).netloc or "unknown",
+                    "source": job_data.get("source", "unknown"),
+                    "batch_num": batch_num,
+                    "batch_size": len(batch),
+                    "duration_seconds": batch_duration,
+                    "batch_cost_usd": batch_cost_usd,
+                    "agent_model": "haiku",
+                    "retry_count": retry_count,
+                    "is_retry": retry_count > 0,
+                    "apply_method": job_data.get("apply_method", "unknown"),
+                    "form_field_count": job_data.get("form_field_count"),
+                    "form_page_count": job_data.get("form_page_count"),
+                    "ph_browser_session_id": job_data.get("ph_browser_session_id"),
+                }
+            except Exception:
+                job_props = {"session_id": SESSION_ID, "job_id": job_dir.name, "batch_num": batch_num, "duration_seconds": batch_duration, "batch_cost_usd": batch_cost_usd}
+
+            if status == "submitted":
+                total_submitted += 1
+                # KPI: app_submitted — AI Success Rate numerator
+                ph_client.capture(distinct_id=DISTINCT_ID, event="app_submitted", properties=job_props)
+            elif status == "blocked":
+                total_blocked += 1
+                block_reason = job_data.get("block_reason", "unknown") if isinstance(job_data, dict) else "unknown"
+                # KPI: automation_blocked — Bot Detection Rate
+                ph_client.capture(distinct_id=DISTINCT_ID, event="automation_blocked",
+                                  properties={**job_props, "machine_ip": machine_ip, "block_reason": block_reason})
+            else:
+                total_failed += 1
+                notify(f"SUBMIT FAILED: {job_dir.name} (status={status})", logger)
+
+        notify(f"SUBMIT BATCH {batch_num} DONE: running total — {total_submitted} submitted, {total_blocked} blocked, {total_failed} failed", logger)
+
+    notify(f"SUBMIT DONE: {total_submitted} submitted, {total_blocked} blocked, {total_failed} failed", logger)
+    return total_submitted, total_blocked, total_failed
+
+
+# ---------------------------------------------------------------------------
+# Upwork pipeline phases
+# ---------------------------------------------------------------------------
+
+def phase_upwork_scout(num_contracts: int, logger: Logger) -> int:
+    """Scout Upwork for contracts. Retries up to 3 times. Returns contracts found."""
+    before = count_contracts()["scouted"]
+    max_retries = 3
+    found_new = 0
+
+    for attempt in range(1, max_retries + 1):
+        remaining = num_contracts - found_new
+        if remaining <= 0:
+            break
+
+        if attempt > 1:
+            notify(f"UPWORK SCOUT RETRY {attempt}/{max_retries}: still need {remaining} more...", logger)
+        else:
+            notify(f"UPWORK SCOUT: Finding {num_contracts} contracts...", logger)
+
+        # Agents self-manage dedup via scout-state.yaml and Glob on data/contracts/
+        # No skip list needed in the prompt
+        prompt = f"""You are the pipeline orchestrator. Scout Upwork for exactly {remaining} new freelance contracts.
+
+Spawn the Upwork-Scouter agent via the Task tool (subagent_type="Upwork-Scouter").
+Tell it to search Upwork for contracts matching: React, TypeScript, full-stack, Python, AI/ML, backend, Node.js.
+The agent will check data/contracts/scout-state.yaml to resume from where previous scouts left off, and will deduplicate against existing data/contracts/ directories automatically.
+
+After scouting completes, list the contracts found with client name and title.
+Do NOT proceed to the propose phase — only scout."""
+
+        exit_code = run_claude(prompt, logger)
+
+        if exit_code != 0:
+            notify(f"UPWORK SCOUT: claude exited with code {exit_code}", logger)
+            ph_client.capture(distinct_id=DISTINCT_ID, event="agent_error",
+                              properties={"session_id": SESSION_ID, "phase": "upwork_scout", "exit_code": exit_code, "agent_model": "haiku"})
+
+        after = count_contracts()["scouted"]
+        found_new = after - before
+        notify(f"UPWORK SCOUT: found {found_new}/{num_contracts} so far", logger)
+
+    if found_new == 0:
+        notify("UPWORK SCOUT FAILED: found 0 contracts after all retries.", logger)
+    elif found_new < num_contracts:
+        notify(f"UPWORK SCOUT PARTIAL: wanted {num_contracts}, got {found_new}.", logger)
+    else:
+        notify(f"UPWORK SCOUT DONE: {found_new} new contracts found.", logger)
+
+    return found_new
+
+
+def phase_upwork_propose(logger: Logger) -> tuple[int, int]:
+    """Write proposals for scouted contracts. All in parallel."""
+    contracts = contracts_with_status("scouted")
+
+    if not contracts:
+        notify("UPWORK PROPOSE: No scouted contracts. Skipping.", logger)
+        return 0, 0
+
+    notify(f"UPWORK PROPOSE: Writing proposals for {len(contracts)} contracts...", logger)
+
+    contract_list = "\n".join(f"- {d}" for d in contracts)
+
+    prompt = f"""You are the pipeline orchestrator. Write proposals for ALL of the following scouted Upwork contracts IN PARALLEL.
+
+Contracts to propose for:
+{contract_list}
+
+For EACH contract, spawn an Upwork-Proposer agent via the Task tool (subagent_type="Upwork-Proposer").
+Launch ALL of them in parallel — do NOT wait for one to finish before starting the next.
+
+Each agent should:
+1. Read contract.yaml for the job details
+2. Read the knowledge base to select relevant projects and skills
+3. Write a tailored proposal (80-150 words)
+4. Calculate a competitive bid
+5. Answer any screening questions
+6. Update contract status to 'proposed'
+
+After ALL agents complete, report a summary: which contracts succeeded and which failed."""
+
+    exit_code = run_claude(prompt, logger)
+    if exit_code != 0:
+        ph_client.capture(distinct_id=DISTINCT_ID, event="agent_error",
+                          properties={"session_id": SESSION_ID, "phase": "upwork_propose", "exit_code": exit_code, "agent_model": "haiku"})
+
+    # Check results
+    succeeded = 0
+    failed = 0
+    for d in contracts:
+        cy = d / "contract.yaml"
+        try:
+            data = yaml.safe_load(cy.read_text())
+            has_proposal = bool(data.get("proposal_text") and data.get("proposed_bid") and read_contract_status(cy) == "proposed")
+            if has_proposal:
+                succeeded += 1
+                ph_client.capture(distinct_id=DISTINCT_ID, event="upwork_proposal_succeeded", properties={
+                    "session_id": SESSION_ID,
+                    "contract_id": d.name,
+                    "client": data.get("client", "unknown"),
+                    "title": data.get("title", "unknown"),
+                    "proposed_bid": data.get("proposed_bid"),
+                    "proposed_bid_type": data.get("proposed_bid_type", "unknown"),
+                    "budget_type": data.get("budget_type", "unknown"),
+                    "budget_low": data.get("budget_low"),
+                    "budget_high": data.get("budget_high"),
+                    "agent_model": "haiku",
+                })
+            else:
+                failed += 1
+                notify(f"UPWORK PROPOSE FAILED: {d.name}", logger)
+                ph_client.capture(distinct_id=DISTINCT_ID, event="upwork_proposal_failed", properties={
+                    "session_id": SESSION_ID,
+                    "contract_id": d.name,
+                    "client": data.get("client", "unknown"),
+                    "title": data.get("title", "unknown"),
+                    "missing_proposal_text": not bool(data.get("proposal_text")),
+                    "missing_bid": not bool(data.get("proposed_bid")),
+                    "agent_model": "haiku",
+                })
+        except Exception:
+            failed += 1
+
+    notify(f"UPWORK PROPOSE DONE: {succeeded} succeeded, {failed} failed", logger)
+    return succeeded, failed
+
+
+def log_contract_inventory(logger: Logger):
+    """Print all existing contracts grouped by status."""
+    if not CFG.contracts_dir.exists():
+        logger.log("No contracts directory yet.")
+        return
+
+    by_status: dict[str, list[str]] = {}
+    for cy in sorted(CFG.contracts_dir.glob("*/contract.yaml")):
+        try:
+            data = yaml.safe_load(cy.read_text())
+            client = data.get("client", "?")
+            title = data.get("title", "?")
+            budget = data.get("budget_range", "?")
+            status = data.get("status", read_contract_status(cy) or "unknown")
+            line = f"  {client} — {title}  ({budget})"
+            by_status.setdefault(status, []).append(line)
+        except Exception:
+            by_status.setdefault("error", []).append(f"  {cy.parent.name} (failed to read)")
+
+    if not by_status:
+        logger.log("No contracts in pipeline yet.")
+        return
+
+    total = sum(len(v) for v in by_status.values())
+    logger.log(f"=== Contract Inventory ({total} total) ===")
+    for status in ("submitted", "approved", "proposed", "scouted", "blocked", "error"):
+        items = by_status.get(status, [])
+        if items:
+            logger.log(f"  [{status.upper()}] ({len(items)})")
+            for line in items:
+                logger.log(line)
+    logger.log("=" * 40)
+
+
+def run_upwork_pipeline(num_contracts: int, phase: str = "all"):
+    """Main entry point for Upwork pipeline."""
+    global _run_cost_usd, _run_tokens
+    _run_cost_usd = 0.0
+    _run_tokens = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+    run_start = time.time()
+    logger = Logger(CFG.log_dir)
+    notify(f"Upwork pipeline started: phase={phase}, contracts={num_contracts}", logger)
+    log_contract_inventory(logger)
+
+    try:
+        if phase in ("upwork-all", "upwork-scout"):
+            found = phase_upwork_scout(num_contracts, logger)
+            if phase == "upwork-all" and found == 0:
+                notify("STOPPING: no contracts scouted.", logger)
+                return
+
+        if phase in ("upwork-all", "upwork-propose"):
+            ok, fail = phase_upwork_propose(logger)
+            if phase == "upwork-all":
+                notify("UPWORK: Scout+propose done. Run 'pipeline upwork approve' to review bids, then 'pipeline upwork submit'.", logger)
+
+        counts = count_contracts()
+        summary = " | ".join(f"{k}={v}" for k, v in counts.items())
+        notify(f"UPWORK PIPELINE COMPLETE: {summary}", logger)
+        ph_client.capture(distinct_id=DISTINCT_ID, event="upwork_pipeline_complete", properties={
+            "session_id": SESSION_ID,
+            "phase": phase,
+            "num_contracts": num_contracts,
+            **counts,
+            "duration_seconds": int(time.time() - run_start),
+            "total_cost_usd": round(_run_cost_usd, 4),
+            "input_tokens": _run_tokens["input"],
+            "output_tokens": _run_tokens["output"],
+            "cache_creation_tokens": _run_tokens["cache_creation"],
+            "cache_read_tokens": _run_tokens["cache_read"],
+            "total_tokens": _run_tokens["input"] + _run_tokens["output"],
+        })
+
+    except KeyboardInterrupt:
+        notify("Upwork pipeline interrupted.", logger)
+        ph_client.capture(distinct_id=DISTINCT_ID, event="upwork_pipeline_interrupted", properties={"session_id": SESSION_ID})
+    except Exception as e:
+        notify(f"Upwork pipeline failed: {e}", logger)
+        ph_client.capture(distinct_id=DISTINCT_ID, event="upwork_pipeline_failed", properties={"session_id": SESSION_ID, "error": str(e)})
+        raise
+    finally:
+        ph_client.flush()
+        logger.close()
+
+
+def log_job_inventory(logger: Logger):
+    """Print all existing jobs grouped by status."""
+    if not CFG.jobs_dir.exists():
+        logger.log("No jobs directory yet.")
+        return
+
+    jobs_by_status: dict[str, list[str]] = {}
+    for job_yaml in sorted(CFG.jobs_dir.glob("*/job.yaml")):
+        try:
+            data = yaml.safe_load(job_yaml.read_text())
+            company = data.get("company", "?")
+            position = data.get("position", "?")
+            status = data.get("status", read_job_status(job_yaml) or "unknown")
+            url = data.get("apply_url", data.get("url", ""))
+            line = f"  {company} — {position}"
+            if url:
+                line += f"  ({url})"
+            jobs_by_status.setdefault(status, []).append(line)
+        except Exception:
+            jobs_by_status.setdefault("error", []).append(f"  {job_yaml.parent.name} (failed to read)")
+
+    if not jobs_by_status:
+        logger.log("No jobs in pipeline yet.")
+        return
+
+    total = sum(len(v) for v in jobs_by_status.values())
+    logger.log(f"=== Job Inventory ({total} total) ===")
+    for status in ("submitted", "built", "scouted", "blocked", "error", "unknown"):
+        jobs = jobs_by_status.get(status, [])
+        if jobs:
+            logger.log(f"  [{status.upper()}] ({len(jobs)})")
+            for line in jobs:
+                logger.log(line)
+    logger.log("=" * 40)
+
+
+def run_pipeline(num_jobs: int, phase: str = "all"):
+    """Main entry point — runs the requested phase(s) with proper routing."""
+    global _run_cost_usd, _run_tokens
+    _run_cost_usd = 0.0
+    _run_tokens = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+    run_start = time.time()
+    logger = Logger(CFG.log_dir)
+    notify(f"Pipeline started: phase={phase}, jobs={num_jobs}", logger)
+    log_job_inventory(logger)
+
+    try:
+        # --- Scout ---
+        if phase in ("all", "scout"):
+            found = phase_scout(num_jobs, logger)
+
+            if phase == "all" and found == 0:
+                notify("STOPPING: no jobs scouted, nothing to build or submit.", logger)
+                return
+
+        # --- Build ---
+        if phase in ("all", "build"):
+            built_ok, built_fail = phase_build(logger)
+
+            if phase == "all" and built_ok == 0:
+                notify("STOPPING: no applications built, nothing to submit.", logger)
+                return
+
+        # --- Submit ---
+        if phase in ("all", "submit"):
+            sub_ok, sub_blocked, sub_fail = phase_submit(logger)
+
+        # --- Retry blocked ---
+        if phase == "retry":
+            sub_ok, sub_blocked, sub_fail = phase_retry_blocked(logger)
+
+        # --- Summary ---
+        counts = count_jobs()
+        summary = " | ".join(f"{k}={v}" for k, v in counts.items())
+        notify(f"PIPELINE COMPLETE: {summary}", logger)
+        total_cost = round(_run_cost_usd, 4)
+        ph_client.capture(distinct_id=DISTINCT_ID, event="pipeline_complete", properties={
+            "session_id": SESSION_ID,
+            "phase": phase,
+            "num_jobs": num_jobs,
+            **counts,
+            "duration_seconds": int(time.time() - run_start),
+            "total_cost_usd": total_cost,
+            "cost_per_submitted_app": compute_cost_per_app(total_cost, counts.get("submitted", 0)),
+            "input_tokens": _run_tokens["input"],
+            "output_tokens": _run_tokens["output"],
+            "cache_creation_tokens": _run_tokens["cache_creation"],
+            "cache_read_tokens": _run_tokens["cache_read"],
+            "total_tokens": _run_tokens["input"] + _run_tokens["output"],
+        })
+
+    except KeyboardInterrupt:
+        notify("Pipeline interrupted by user.", logger)
+        ph_client.capture(distinct_id=DISTINCT_ID, event="pipeline_interrupted", properties={"session_id": SESSION_ID})
+    except Exception as e:
+        notify(f"Pipeline failed: {e}", logger)
+        ph_client.capture(distinct_id=DISTINCT_ID, event="pipeline_failed", properties={"session_id": SESSION_ID, "error": str(e)})
+        raise
+    finally:
+        ph_client.flush()
+        logger.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI commands (the phone-friendly part)
+# ---------------------------------------------------------------------------
+
+def cmd_status():
+    counts = count_jobs()
+    running = is_pipeline_running()
+
+    print("--- Job Pipeline Status ---")
+    for status, n in counts.items():
+        print(f"  {status.capitalize():12s} {n}")
+    print()
+    if running:
+        print("  Pipeline:  RUNNING")
+    else:
+        print("  Pipeline:  idle")
+    print()
+
+    # Print full job inventory
+    if CFG.jobs_dir.exists():
+        jobs_by_status: dict[str, list[str]] = {}
+        for job_yaml in sorted(CFG.jobs_dir.glob("*/job.yaml")):
+            try:
+                data = yaml.safe_load(job_yaml.read_text())
+                company = data.get("company", "?")
+                position = data.get("position", "?")
+                status = data.get("status", read_job_status(job_yaml) or "unknown")
+                url = data.get("apply_url", data.get("url", ""))
+                line = f"    {company} — {position}"
+                if url:
+                    line += f"\n      {url}"
+                jobs_by_status.setdefault(status, []).append(line)
+            except Exception:
+                pass
+
+        for status in ("submitted", "built", "scouted", "blocked"):
+            jobs = jobs_by_status.get(status, [])
+            if jobs:
+                print(f"  [{status.upper()}]")
+                for line in jobs:
+                    print(line)
+
+    # Upwork contracts
+    c_counts = count_contracts()
+    if any(v > 0 for v in c_counts.values()):
+        print()
+        cmd_upwork_status()
+
+
+def cmd_upwork_status():
+    """Show Upwork contract counts and inventory."""
+    counts = count_contracts()
+    running = is_pipeline_running(CFG.upwork_tmux_session)
+
+    print("--- Upwork Pipeline Status ---")
+    for status, n in counts.items():
+        print(f"  {status.capitalize():12s} {n}")
+    print()
+    if running:
+        print("  Upwork:    RUNNING")
+    else:
+        print("  Upwork:    idle")
+    print()
+
+    if not CFG.contracts_dir.exists():
+        return
+    by_status: dict[str, list[str]] = {}
+    for cy in sorted(CFG.contracts_dir.glob("*/contract.yaml")):
+        try:
+            data = yaml.safe_load(cy.read_text())
+            client = data.get("client", "?")
+            title = data.get("title", "?")
+            budget = data.get("budget_range", "?")
+            bid = data.get("proposed_bid")
+            status = data.get("status", read_contract_status(cy) or "unknown")
+            line = f"    {client} — {title}  ({budget})"
+            if bid:
+                line += f"  [bid: ${bid}]"
+            by_status.setdefault(status, []).append(line)
+        except Exception:
+            pass
+
+    for status in ("submitted", "approved", "proposed", "scouted", "blocked"):
+        items = by_status.get(status, [])
+        if items:
+            print(f"  [{status.upper()}]")
+            for line in items:
+                print(line)
+
+
+def cmd_log():
+    log = get_latest_log()
+    if log:
+        lines = log.read_text().splitlines()
+        for line in lines[-50:]:
+            print(line)
+    else:
+        print("No logs found.")
+
+
+def cmd_follow():
+    log = get_latest_log()
+    if not log:
+        print("No logs found. Is the pipeline running?")
+        return
+    print(f"Following {log.name} (ctrl+c to stop)...")
+    subprocess.run(["tail", "-f", str(log)])
+
+
+def cmd_watch():
+    """Auto-refreshing dashboard. Prints status + last 10 log lines every 5s."""
+    try:
+        while True:
+            os.system("clear")
+            print(f"=== Pipeline Monitor ({datetime.now().strftime('%H:%M:%S')}) ===\n")
+
+            # Jobs
+            counts = count_jobs()
+            print("  --- Jobs (LinkedIn/Indeed) ---")
+            for status, n in counts.items():
+                print(f"    {status.capitalize():12s} {n}")
+            print(f"    {'Pipeline:':12s} {'RUNNING' if is_pipeline_running() else 'idle'}")
+
+            # Contracts
+            c_counts = count_contracts()
+            if any(v > 0 for v in c_counts.values()) or is_pipeline_running(CFG.upwork_tmux_session):
+                print()
+                print("  --- Contracts (Upwork) ---")
+                for status, n in c_counts.items():
+                    print(f"    {status.capitalize():12s} {n}")
+                print(f"    {'Upwork:':12s} {'RUNNING' if is_pipeline_running(CFG.upwork_tmux_session) else 'idle'}")
+
+            print()
+
+            log = get_latest_log()
+            if log:
+                print("--- Recent Activity ---")
+                lines = log.read_text().splitlines()
+                for line in lines[-10:]:
+                    print(line)
+            else:
+                print("  No logs yet.")
+
+            time.sleep(5)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_stop():
+    killed = False
+    for session in (CFG.tmux_session, CFG.upwork_tmux_session):
+        if is_pipeline_running(session):
+            subprocess.run(["tmux", "kill-session", "-t", session])
+            print(f"tmux session '{session}' killed.")
+            killed = True
+    if not killed:
+        print("No tmux sessions running.")
+
+    # Kill any claude -p processes spawned by the pipeline
+    result = subprocess.run(
+        ["pgrep", "-af", "claude.*-p.*--max-turns"],
+        capture_output=True, text=True,
+    )
+    if result.stdout.strip():
+        pids = [line.split()[0] for line in result.stdout.strip().splitlines()]
+        for pid in pids:
+            subprocess.run(["kill", pid], capture_output=True)
+        print(f"Killed {len(pids)} claude process(es).")
+    else:
+        print("No claude processes running.")
+
+
+def cmd_nuke():
+    """Kill everything — tmux, all claude -p, all subagent processes."""
+    # Kill tmux
+    subprocess.run(["tmux", "kill-server"], capture_output=True)
+    print("All tmux sessions killed.")
+
+    # Kill all claude processes (pipeline + subagents)
+    result = subprocess.run(
+        ["pgrep", "-f", "claude.*--dangerously-skip-permissions"],
+        capture_output=True, text=True,
+    )
+    if result.stdout.strip():
+        pids = result.stdout.strip().splitlines()
+        for pid in pids:
+            subprocess.run(["kill", "-9", pid.strip()], capture_output=True)
+        print(f"Force-killed {len(pids)} claude process(es).")
+    else:
+        print("No claude processes found.")
+
+    # Kill any leftover chrome/chromium from playwright
+    for proc in ("chrome", "chromium"):
+        subprocess.run(["pkill", "-f", proc], capture_output=True)
+
+    print("Everything cleaned up.")
+
+
+def cmd_attach():
+    if is_pipeline_running():
+        subprocess.run(["tmux", "attach", "-t", CFG.tmux_session])
+    else:
+        print("No pipeline running.")
+
+
+def launch_in_tmux(phase: str, num_jobs: int, session: str | None = None):
+    """Start the pipeline inside a detached tmux session."""
+    session = session or CFG.tmux_session
+    if not shutil.which("tmux"):
+        print("tmux is not installed. Run: sudo pacman -S tmux")
+        return
+    if is_pipeline_running(session):
+        print(f"Pipeline '{session}' is already running. Use 'pipeline stop' first.")
+        return
+
+    # Build the python command that tmux will run
+    script = Path(__file__).resolve()
+    cmd = f"python3 {script} --run {phase} {num_jobs}"
+
+    # Pass DISPLAY/WAYLAND_DISPLAY so Chrome can open windows
+    display = os.environ.get("DISPLAY", ":1")
+    wayland = os.environ.get("WAYLAND_DISPLAY", "")
+    env_vars = f"export DISPLAY={display};"
+    if wayland:
+        env_vars += f" export WAYLAND_DISPLAY={wayland};"
+
+    subprocess.run([
+        "tmux", "new-session", "-d", "-s", session,
+        "bash", "-c", f'{env_vars} {cmd}; sleep 5',
+    ])
+
+    print(f"Pipeline started in background ({phase}, {num_jobs}).")
+    print("  pipeline watch   — live dashboard")
+    print("  pipeline follow  — stream logs")
+    print("  pipeline status  — quick check")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+
+    cmd = args[0]
+
+    # Internal flag: tmux calls this to actually run the pipeline
+    if cmd == "--run":
+        phase = args[1] if len(args) > 1 else "all"
+        num = int(args[2]) if len(args) > 2 else 5
+        if phase.startswith("upwork"):
+            run_upwork_pipeline(num, phase)
+        else:
+            run_pipeline(num, phase)
+        return
+
+    # Status & monitoring commands
+    if cmd in ("status", "s"):
+        cmd_status()
+    elif cmd in ("log", "l"):
+        cmd_log()
+    elif cmd in ("follow", "f"):
+        cmd_follow()
+    elif cmd in ("watch", "w"):
+        cmd_watch()
+    elif cmd in ("stop", "x"):
+        cmd_stop()
+    elif cmd == "nuke":
+        cmd_nuke()
+    elif cmd in ("attach", "a"):
+        cmd_attach()
+
+    # Phase commands — launch in tmux
+    elif cmd == "scout":
+        num = int(args[1]) if len(args) > 1 else 5
+        launch_in_tmux("scout", num)
+    elif cmd in ("build", "b"):
+        launch_in_tmux("build", 0)
+    elif cmd in ("submit", "sub"):
+        launch_in_tmux("submit", 0)
+    elif cmd in ("retry", "retry-blocked"):
+        launch_in_tmux("retry", 0)
+
+    # Bare number = full pipeline
+    elif cmd.isdigit():
+        launch_in_tmux("all", int(cmd))
+
+    # Upwork commands
+    elif cmd == "upwork":
+        subcmd = args[1] if len(args) > 1 else "help"
+
+        if subcmd == "scout":
+            num = int(args[2]) if len(args) > 2 else 5
+            launch_in_tmux("upwork-scout", num, session=CFG.upwork_tmux_session)
+        elif subcmd in ("propose", "prop", "p"):
+            launch_in_tmux("upwork-propose", 0, session=CFG.upwork_tmux_session)
+        elif subcmd in ("status", "s"):
+            cmd_upwork_status()
+        elif subcmd.isdigit():
+            # "pipeline upwork 10" = scout + propose
+            launch_in_tmux("upwork-all", int(subcmd), session=CFG.upwork_tmux_session)
+        else:
+            print("Upwork commands:")
+            print("  pipeline upwork 10          Scout + propose 10 contracts")
+            print("  pipeline upwork scout 5     Scout Upwork for 5 contracts")
+            print("  pipeline upwork propose     Write proposals for scouted contracts")
+            print("  pipeline upwork status      Show contract counts")
+            print("  (bid approval and submission are done manually via Claude Code)")
+
+    else:
+        print(f"Unknown command: {cmd}")
+        print("Run 'pipeline help' for usage.")
+
+
+if __name__ == "__main__":
+    main()

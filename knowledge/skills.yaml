@@ -1,0 +1,63 @@
+# Skills Knowledge Base — CUSTOMIZE THIS
+# Proficiency levels: expert, advanced, intermediate
+# The build agent uses this to curate skills sections per job posting
+
+languages:
+  - name: TypeScript
+    proficiency: expert
+    notes: >-
+      Describe where and how you've used this language.
+
+  - name: Python
+    proficiency: advanced
+    notes: >-
+      Describe where and how you've used this language.
+
+  # Add more languages...
+
+frameworks_and_libraries:
+  frontend:
+    - name: React
+      proficiency: expert
+      notes: >-
+        Describe your experience with this framework.
+    # Add more...
+
+  backend:
+    - name: Express
+      proficiency: advanced
+      notes: >-
+        Describe your experience.
+    # Add more...
+
+  # Add more categories: orm_and_database, ai_and_ml, testing, etc.
+
+tools_and_platforms:
+  cloud:
+    - name: AWS Lambda
+      proficiency: advanced
+      notes: >-
+        Describe your experience.
+    # Add more...
+
+  databases:
+    - name: PostgreSQL
+      proficiency: advanced
+      notes: >-
+        Describe your experience.
+    # Add more...
+
+  # Add more categories: devops, platforms, other_tools, etc.
+
+concepts:
+  architecture:
+    - "Microservices Architecture"
+    - "Serverless Architecture"
+    # Add more...
+
+  design_patterns:
+    - "Repository Pattern"
+    - "Dependency Injection"
+    # Add more...
+
+  # Add more categories: principles, methodologies, data_and_ai, etc.
