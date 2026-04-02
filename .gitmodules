@@ -1,0 +1,3 @@
+[submodule "playwright-mcp"]
+	path = playwright-mcp
+	url = https://github.com/KeySmash-LLC/playwright-mcp.git
