@@ -1,0 +1,27 @@
+# Personal data
+data/jobs/
+data/contracts/
+data/explorer.db
+data/scout-state.yaml
+data/upwork-scout-state.yaml
+
+# Credentials & secrets
+.env
+knowledge/credentials.yaml
+
+# Runtime artifacts
+logs/
+.playwright-mcp/
+.venv/
+__pycache__/
+*.pyc
+
+# Claude Code local state
+.claude/hooks/.sessions/
+.claude/settings.json
+
+# Submodule build artifacts
+playwright-mcp/node_modules/
+playwright-mcp/packages/*/dist/
+playwright-mcp/packages/*/node_modules/
+playwright-mcp/playwright/packages/playwright/lib/

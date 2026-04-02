@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "explorer-db": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-sqlite",
+        "--db-path",
+        "./data/explorer.db"
+      ]
+    },
+    "playwright-mux-parallel": {
+      "command": "bash",
+      "args": [
+        "./scripts/start-playwright-mux.sh"
+      ]
+    }
+  }
+}

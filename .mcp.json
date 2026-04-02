@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "playwright-mux-parallel": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "./playwright-mcp/packages/playwright-mcp-multiplexer/dist/cli.js",
+        "--browser=chrome",
+        "--headed",
+        "--user-data-dir=/home/anton/.config/chrome-automation",
+        "--init-script=./scripts/posthog-bundle.js",
+        "--init-script=./scripts/posthog-init.js",
+        "--bypass-csp"
+      ],
+      "env": {}
+    },
+    "explorer-db": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "mcp-server-sqlite",
+        "--db-path",
+        "./data/explorer.db"
+      ],
+      "env": {}
+    }
+  }
+}
