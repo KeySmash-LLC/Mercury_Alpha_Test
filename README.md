@@ -2,14 +2,11 @@
 
 An automated job application pipeline powered by Claude Code agents and Playwright MCP browser automation.
 
-# BEFORE USE:
+## Before use
 
-- Remember, this is an Alpha test, a pre-release version of the software.
-- Install Google Chrome, sign in with a valid Google account, and (temporarily) disable adblockers.
-- Have an active subscription to Claude. The lowest package at $20/month is sufficient but will limit the number of applications that can be filled.
-- AI can and does make mistakes, submitted applications may contain these mistakes.
-
-# By using this you accept the risk that your LinkedIn account and/or your IP may be banned by the service.
+- This is an **Alpha test** — a pre-release version of the software.
+- AI can and does make mistakes. Submitted applications may contain errors.
+- **By using this you accept the risk that your LinkedIn account and/or your IP may be banned by the service.**
 
 ## What it does
 
@@ -29,46 +26,31 @@ Scout (browser) → User Review → Build (AI + LaTeX) → User Review → Submi
 
 There's also a parallel **Upwork pipeline** (Scout → Propose → Fill Form → Manual Submit).
 
-## Prerequisites
+## Requirements
 
+- Linux (tested on Ubuntu/WSL2)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) with an Anthropic API key
-- [tectonic](https://tectonic-typesetting.github.io/) for LaTeX compilation
-- Google Chrome (`google-chrome-stable`)
-- Python 3.12+ with `pyyaml` and `requests`
-- Node.js 18+ and npm (for building the bundled Playwright MCP multiplexer)
+- A Google Chrome-compatible display (WSLg on WSL2, or a native X11/Wayland display)
 - `tmux` (optional, for background pipeline execution)
+
+All other dependencies (Chrome, Node.js, Python, tectonic, Xvfb) are installed by the setup script.
 
 ## Quick Start
 
-1. **Clone and build**
+1. **Clone and set up**
    ```bash
-   git clone --recursive https://github.com/KeySmash-LLC/Project-Mercury-V1.git
-   cd Project-Mercury-V1
-   ./scripts/build-mcp.sh          # Build the bundled Playwright MCP multiplexer
-   pip install mcp-server-sqlite   # Install the SQLite MCP server
-   python scripts/import_to_db.py  # Initialize the job database
-   cp .env.example .env
-   cp knowledge/credentials.yaml.example knowledge/credentials.yaml
+   git clone --recursive <repo-url>
+   cd Mercury_Alpha_Test
+   ./setup.sh
    ```
+   The setup script installs all system dependencies, builds the Playwright MCP multiplexer, creates a Python virtual environment, scaffolds configuration files, initializes the database, and walks you through Chrome profile authentication. See [ENVIRONMENT.md](ENVIRONMENT.md) for manual setup or troubleshooting.
 
-   MCP servers are workspace-local — `.claude/mcp.json` is pre-configured. No global setup needed.
-
-2. **Set up Chrome profile** — log into job boards once so agents can reuse sessions
-   ```bash
-   ./scripts/setup-chrome-profile.sh
-   ```
-   This opens Chrome with a dedicated automation profile. Log into LinkedIn, Indeed, Upwork, then close Chrome. The multiplexer copies auth from this profile for every browser instance.
-
-3. **Populate your knowledge base** — see [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) for details
-   - Drop your resume into `setup/` and ask Claude to "set up the pipeline" (automated), or
+2. **Populate your knowledge base** — see [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) for details
+   - Drop your resume (PDF/TXT/MD) into `setup/` and ask Claude to "set up the pipeline" (automated), or
    - Manually edit `knowledge/profile.yaml`, `skills.yaml`, experience and project files, and template headers
+   - Fill in `knowledge/credentials.yaml` with your ATS login passwords
 
-4. **Initialize the database**
-   ```bash
-   python scripts/import_to_db.py
-   ```
-
-5. **Run the pipeline**
+3. **Run the pipeline**
    ```bash
    python scripts/pipeline 10          # Scout + build + submit 10 jobs
    python scripts/pipeline scout 15    # Scout only
@@ -78,17 +60,19 @@ There's also a parallel **Upwork pipeline** (Scout → Propose → Fill Form →
    python scripts/pipeline watch       # Live dashboard
    ```
 
+   Or open Claude Code in the project directory and use it conversationally.
+
 ## Project Structure
 
 ```
 ├── .claude/
 │   ├── agents/           # Subagent instruction files (scout, build, submit, upwork-*)
-│   └── hooks/            # Activity logging hook
+│   └── hooks/            # Activity logging hook (optional)
 ├── data/
 │   ├── schema.sql        # SQLite schema for job registry
+│   ├── explorer.db       # SQLite job/contract registry (created by setup)
 │   ├── jobs/             # Per-job directories (created at runtime)
 │   └── contracts/        # Per-contract directories (Upwork, created at runtime)
-├── docs/                 # Pipeline specs and design docs
 ├── knowledge/            # Your personal knowledge base (customize these!)
 │   ├── profile.yaml      # Contact info, education, work auth
 │   ├── skills.yaml       # Skills with proficiency levels
@@ -96,10 +80,14 @@ There's also a parallel **Upwork pipeline** (Scout → Propose → Fill Form →
 │   ├── experience/       # One YAML per work experience
 │   └── projects/         # One YAML per project
 ├── scripts/
-│   └── pipeline          # CLI entry point
+│   ├── pipeline          # CLI entry point
+│   ├── build-mcp.sh      # Build the Playwright MCP multiplexer
+│   ├── setup-chrome-profile.sh  # Chrome authentication setup
+│   └── ...               # Analytics, import, validation scripts
 ├── templates/
 │   ├── resume.tex        # LaTeX resume template
 │   └── cover_letter.tex  # LaTeX cover letter template
+├── setup.sh              # One-shot bootstrap script
 ├── CLAUDE.md             # Orchestrator instructions for Claude Code
 ├── ENVIRONMENT.md        # System/infrastructure setup guide
 └── KNOWLEDGE_BASE.md     # Personal data setup: resume, skills, experience

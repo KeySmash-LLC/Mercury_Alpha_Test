@@ -4,10 +4,32 @@ System and infrastructure setup: dependencies, Chrome profile, database, and MCP
 
 ---
 
+## Automated Setup (Recommended)
+
+The setup script handles everything — system dependencies, Playwright build, Python environment, database initialization, configuration files, and Chrome profile authentication:
+
+```bash
+git clone --recursive <repo-url>
+cd Mercury_Alpha_Test
+./setup.sh
+```
+
+The script is idempotent — safe to re-run if something fails partway through. It prompts before installing anything that requires `sudo` and skips steps that are already complete.
+
+After setup finishes, continue with:
+1. Drop your resume into `setup/` and run the Setup Agent (see [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md))
+2. Fill in `knowledge/credentials.yaml` with your ATS login passwords
+3. Start the pipeline: `python scripts/pipeline 10`
+
+The rest of this document covers **manual setup and troubleshooting** — you only need it if the setup script fails or you want to understand what each step does.
+
+---
+
 ## Prerequisites
 
-Install these before anything else.
-On a fresh Linux install run these first:
+Install these before anything else (or let `setup.sh` handle them).
+
+On a fresh Linux install:
 ```bash
 sudo apt update && sudo apt upgrade -y
 ```
@@ -24,6 +46,8 @@ Requires an [Anthropic API key](https://console.anthropic.com/). On first run, `
 
 ### System packages
 
+These are installed automatically by `setup.sh`. For manual installation:
+
 ```bash
 # Chrome (for browser automation)
 wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
@@ -38,7 +62,7 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
 # Python 3 + pip (for pipeline scripts and SQLite MCP server)
-sudo apt-get install -y python3 python3-pip
+sudo apt-get install -y python3 python3-pip python3-venv
 
 # tectonic (LaTeX compiler for resume/cover letter PDFs)
 mkdir -p ~/.local/bin
@@ -74,17 +98,19 @@ The node process finds it at `/usr/bin/Xvfb` regardless of your shell PATH.
 
 ---
 
-## Step 1 — Clone and initialize submodules
+## Manual Setup Steps
+
+These steps are what `setup.sh` automates. Use them for troubleshooting or if you prefer manual control.
+
+### Step 1 — Clone and initialize submodules
 
 ```bash
-git clone <repo-url> Project-Mercury-V1
-cd Project-Mercury-V1
+git clone <repo-url> Mercury_Alpha_Test
+cd Mercury_Alpha_Test
 git submodule update --init --recursive
 ```
 
----
-
-## Step 2 — Build the Playwright MCP Multiplexer
+### Step 2 — Build the Playwright MCP Multiplexer
 
 ```bash
 ./scripts/build-mcp.sh
@@ -98,31 +124,15 @@ Verify the build output exists:
 ls playwright-mcp/packages/playwright-mcp-multiplexer/dist/cli.js
 ```
 
----
-
-## Step 3 — Fix the MCP config user path
-
-`.mcp.json` ships with a hardcoded placeholder username in `--user-data-dir`. **Update it to your actual username before anything else:**
+### Step 3 — Python environment
 
 ```bash
-# Find the line and replace with your username
-sed -i "s|/home/electron/.config/chrome-automation|$HOME/.config/chrome-automation|g" .mcp.json
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pyyaml requests posthog
 ```
 
-Or edit `.mcp.json` manually — change:
-```
-"--user-data-dir=/home/electron/.config/chrome-automation"
-```
-to:
-```
-"--user-data-dir=/home/YOUR_USERNAME/.config/chrome-automation"
-```
-
-**This must be done before setting up the Chrome profile**, otherwise the multiplexer won't find the profile and browser instances will launch unauthenticated.
-
----
-
-## Step 4 — Set up the Chrome automation profile
+### Step 4 — Set up the Chrome automation profile
 
 Scout and submit agents use headed Chrome. The multiplexer copies auth from a dedicated profile into each browser instance, so you only need to log in once.
 
@@ -141,42 +151,72 @@ ls ~/.config/chrome-automation/Default/
 
 **Re-authenticating:** If sessions expire, run the script again. Close all multiplexer instances first to avoid profile lock conflicts.
 
-**Custom profile location:** Set `CHROME_AUTOMATION_PROFILE=/your/path` before running the script, then update `--user-data-dir` in `.mcp.json` to match.
+**Custom profile location:** Set `CHROME_AUTOMATION_PROFILE=/your/path` before running the script, then update the path in `.mcp.json` to match.
 
----
-
-## Step 5 — Initialize the SQLite database
+### Step 5 — Initialize the SQLite database
 
 ```bash
-pip install mcp-server-sqlite   # or: pipx install mcp-server-sqlite
 python scripts/import_to_db.py
 ```
 
 This creates `data/explorer.db` with the schema from `data/schema.sql`. The `explorer-db` MCP server uses this as the canonical job/contract registry.
 
----
+### Step 6 — Environment variables
 
-## Step 6 — Environment variables
+The setup script creates `.env` interactively. To create it manually:
 
 ```bash
-cp .env.example .env
+cat > .env <<EOF
+POSTHOG_API_KEY=your-key-here
+POSTHOG_USER_NAME=your-name
+POSTHOG_DISTINCT_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
+EOF
 ```
 
 | Variable | Required | Purpose |
 |---|---|---|
 | `POSTHOG_API_KEY` | Yes | Pipeline analytics — agents and pipeline script both use this |
 | `POSTHOG_USER_NAME` | No | Your display name in analytics |
+| `POSTHOG_DISTINCT_ID` | Auto | Unique analytics ID (generated by setup script) |
 | `DEEP_SEEK_API_KEY` | No | DeepSeek model for build agents |
 | `GOOGLE_API_KEY` | No | Gemini embeddings |
 | `ANONYMIZED_TELEMETRY` | No | Set `false` to disable telemetry |
 
----
+### Step 7 — MCP configuration
 
-## Step 7 — Knowledge base
+The setup script creates `.mcp.json` automatically. To create it manually:
+
+```bash
+cat > .mcp.json <<EOF
+{
+  "mcpServers": {
+    "playwright-mux-parallel": {
+      "command": "bash",
+      "args": [
+        "$(pwd)/scripts/start-playwright-mux.sh",
+        "--max-instances=10"
+      ]
+    },
+    "explorer-db": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-sqlite",
+        "--db-path",
+        "$(pwd)/data/explorer.db"
+      ]
+    }
+  }
+}
+EOF
+```
+
+The `start-playwright-mux.sh` launcher resolves `$HOME` at runtime, so no hardcoded username is needed.
+
+### Step 8 — Knowledge base
 
 The pipeline generates tailored resumes from your personal knowledge base in `knowledge/`. See **`KNOWLEDGE_BASE.md`** for full schema reference and manual instructions.
 
-### Automated setup (recommended)
+#### Automated setup (recommended)
 
 Drop your resume (PDF, `.txt`, or `.md`) into the `setup/` directory, then ask Claude:
 
@@ -186,7 +226,7 @@ Set up the pipeline with my resume. I'm in <City, State>. <Work authorization>.
 
 The setup agent reads your resume and automatically fills `profile.yaml`, `skills.yaml`, all experience and project files, and the template headers. It generates all three bullet variants (technical/impact/leadership) for every entry. It outputs a checklist of what was filled and what still needs manual input.
 
-### Credentials (always manual)
+#### Credentials (always manual)
 
 ```bash
 cp knowledge/credentials.yaml.example knowledge/credentials.yaml
@@ -194,9 +234,7 @@ cp knowledge/credentials.yaml.example knowledge/credentials.yaml
 
 Fill in your ATS login credentials. The submit agent uses these when browser sessions expire. This file is gitignored — the setup agent does not touch it.
 
----
-
-## Step 8 — Verify everything
+### Step 9 — Verify everything
 
 ```bash
 # System dependencies
@@ -220,7 +258,7 @@ printf '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024
 Then open the project in Claude Code and confirm both MCP servers connect:
 
 ```bash
-cd /path/to/Project-Mercury-V1
+cd Mercury_Alpha_Test
 claude
 # Ask: "What MCP servers are available?"
 ```
@@ -229,7 +267,7 @@ claude
 
 ---
 
-## Step 9 — Optional: activity logging
+## Optional: activity logging
 
 Create `.claude/settings.json` to log all tool calls to `logs/YYYY-MM-DD.jsonl`:
 
@@ -298,22 +336,23 @@ Or talk to Claude Code directly in the project directory — it orchestrates all
 
 ## Setup checklist
 
+If you ran `./setup.sh`, most infrastructure items are already done. Use this to verify.
+
 ### Infrastructure
-- [ ] Claude Code installed (`npm install -g @anthropic/claude-code`) and authenticated
+- [ ] Claude Code installed and authenticated
+- [ ] `./setup.sh` completed without errors (handles all items below)
 - [ ] `google-chrome-stable` installed
 - [ ] `Xvfb` installed at `/usr/bin/Xvfb`
 - [ ] `node` 18+ installed
-- [ ] `python3` installed
+- [ ] `python3` + virtual environment (`.venv/`) set up
 - [ ] `tectonic` installed
-- [ ] WSL display working (`$DISPLAY` set)
-- [ ] Submodules initialized (`git submodule update --init --recursive`)
-- [ ] Multiplexer built (`./scripts/build-mcp.sh`)
-- [ ] `.mcp.json` `--user-data-dir` updated to your actual username
+- [ ] WSL display working (`$DISPLAY` set) — WSL2 only
+- [ ] Submodules initialized and multiplexer built
+- [ ] `.mcp.json` created (setup script uses runtime path resolution)
 - [ ] Chrome profile created and logged into LinkedIn, Indeed, Upwork
-- [ ] SQLite database initialized (`python scripts/import_to_db.py`)
-- [ ] `.env` created and API keys filled in
-- [ ] Multiplexer responds to `tools/list` without errors
-- [ ] Claude Code restarted after editing `.mcp.json`
+- [ ] SQLite database initialized (`data/explorer.db` exists)
+- [ ] `.env` created with PostHog API key
+- [ ] Claude Code restarted after setup (to load MCP servers)
 
 ### Knowledge base (see KNOWLEDGE_BASE.md)
 - [ ] Resume dropped into `setup/` and setup agent run
