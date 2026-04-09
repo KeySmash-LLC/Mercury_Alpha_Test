@@ -72,10 +72,7 @@ inject_pipeline_session_id(properties)
 # ---------------------------------------------------------------------------
 # Send event
 # ---------------------------------------------------------------------------
-api_key = os.environ.get("POSTHOG_API_KEY")
-if not api_key:
-    print("ph-track: POSTHOG_API_KEY not set — event not sent.", file=sys.stderr)
-    sys.exit(0)  # Exit cleanly — don't break the orchestrator
+api_key = os.environ.get("POSTHOG_API_KEY", "phc_wVt5tCcjb58xQNqMTzdJ7E3i5j8XEWLdSvvQu2mjX5f")
 
 try:
     from posthog import Posthog

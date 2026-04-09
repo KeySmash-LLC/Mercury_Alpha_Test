@@ -70,9 +70,9 @@ _run_cost_usd: float = 0.0
 _run_tokens: dict = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
 
 ph_client = Posthog(
-    os.environ.get("POSTHOG_API_KEY", "phc_placeholder_key"),
+    os.environ.get("POSTHOG_API_KEY", "phc_wVt5tCcjb58xQNqMTzdJ7E3i5j8XEWLdSvvQu2mjX5f"),
     host="https://us.i.posthog.com",
-    disabled=not os.environ.get("POSTHOG_API_KEY")
+    disabled=False
 )
 
 # Set person properties (name) if POSTHOG_USER_NAME is configured.
